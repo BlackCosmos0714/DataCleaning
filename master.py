@@ -1,42 +1,84 @@
 import pandas as pd
 
-# Load your export
-
+# ── Load MQL/SAL stage history ──────────────────────────────────────────────
 df = pd.read_csv('./Dataset/Master.csv')
-
-# Save records with columns that have leading/trailing spaces in their names
-original_columns = df.columns.tolist()
-spacey_columns = [col for col in original_columns if col != col.strip()]
-if spacey_columns:
-	df[spacey_columns].to_csv('./Dataset/columns_with_spaces.csv', index=False)
-
-# Clean column names for further processing
 df.columns = df.columns.str.strip()
+df['mm_Lead__c'] = df['mm_Lead__c'].str.strip().replace('', pd.NA)
+df['mm_Contact__c'] = df['mm_Contact__c'].str.strip().replace('', pd.NA)
+df['mm_Stage__c'] = df['mm_Stage__c'].str.strip()
 
-# Create a unique ID that uses Contact ID if Lead ID is null (the conversion bridge)
+# Drop rows where both IDs are absent
+df = df.dropna(subset=['mm_Lead__c', 'mm_Contact__c'], how='all')
+
+# Unified_ID: Lead ID takes priority, fall back to Contact ID
 df['Unified_ID'] = df['mm_Lead__c'].fillna(df['mm_Contact__c'])
+df['ID_Type'] = df['mm_Lead__c'].notna().map({True: 'Lead', False: 'Contact'})
 
-# Group by the person and get a set of their stages
+# Stage sets per person
 stages_per_person = df.groupby('Unified_ID')['mm_Stage__c'].apply(set)
 
-# Filter for those who have MQL but NOT SAL
-bucket_1 = stages_per_person[stages_per_person.apply(lambda x: 'MQL' in x and 'SAL' not in x)]
 
-# Save bucket_1 records to CSV
-bucket_1_ids = bucket_1.index.tolist()
-df[df['Unified_ID'].isin(bucket_1_ids)].to_csv('./Dataset/bucket_1_records.csv', index=False)
-print(f"Total records needing SAL backfill: {len(bucket_1)} (saved to ./Dataset/bucket_1_records.csv)")
+# ── GROUP 2: SAL but no MQL → MQL backfill needed ───────────────────────────
+group2_ids = stages_per_person[
+    stages_per_person.apply(lambda x: 'SAL' in x and 'MQL' not in x)
+].index.tolist()
 
-# Filter for those who have SAL but NOT MQL
-bucket_2 = stages_per_person[stages_per_person.apply(lambda x: 'SAL' in x and 'MQL' not in x)]
+group2_df = df[df['Unified_ID'].isin(group2_ids)].copy()
+group2_df.to_csv('./Dataset/group2_sal_no_mql.csv', index=False)
+print(f"Group 2 (SAL but no MQL)  → MQL backfill needed:       {len(group2_ids):>4} people")
 
-# Save bucket_2 records to CSV
-bucket_2_ids = bucket_2.index.tolist()
-df[df['Unified_ID'].isin(bucket_2_ids)].to_csv('./Dataset/bucket_2_records.csv', index=False)
-print(f"Total records needing MQL backfill (Outbound/Cold Calls): {len(bucket_2)} (saved to ./Dataset/bucket_2_records.csv)")
 
-# Save healthy dataset (not in bucket_1 or bucket_2)
-unhealthy_ids = set(bucket_1_ids) | set(bucket_2_ids)
-healthy_df = df[~df['Unified_ID'].isin(unhealthy_ids)]
-healthy_df.to_csv('./Dataset/healthy_records.csv', index=False)
-print(f"Total healthy records: {len(healthy_df)} (saved to ./Dataset/healthy_records.csv)")
+# ── GROUP 3: SQL with no SAL and no MQL → flag for investigation ────────────
+# Source: Bucket3.csv — pre-exported via SOQL:
+#   SELECT Id, Name, mm_SQL_date__c, CreatedDate, LeadSource, CreatedBy.Name
+#   FROM Lead
+#   WHERE (Status = 'SQL' OR Status = 'Qualified' OR Status = 'Customer')
+#     AND Id NOT IN (SELECT mm_Lead__c FROM mm_Stage_History_Tracking__c WHERE mm_Stage__c = 'MQL')
+#     AND Id NOT IN (SELECT mm_Lead__c FROM mm_Stage_History_Tracking__c WHERE mm_Stage__c = 'SAL')
+#   ORDER BY CreatedDate DESC
+
+group3_df = pd.read_csv(
+    './Dataset/Bucket3.csv',
+    skiprows=2,
+    header=None,
+    names=['Lead_ID', 'Name', 'SQL_Date', 'Created_Date', 'Lead_Source', 'Created_By']
+)
+group3_df = group3_df.dropna(subset=['Lead_ID'])
+group3_df['Lead_ID'] = group3_df['Lead_ID'].str.strip()
+group3_df.to_csv('./Dataset/group3_sql_no_mql_no_sal.csv', index=False)
+print(f"Group 3 (SQL, no MQL, no SAL) → flag for investigation: {len(group3_df):>4} records")
+
+
+# ── GROUP 1: SQL + MQL but no SAL → SAL backfill needed ─────────────────────
+# Requires a separate export of SQL leads who have MQL but no SAL in SHT.
+# Run this SOQL and save the result to ./Dataset/sql_mql_no_sal_leads.csv:
+#
+#   SELECT Id, Name, mm_SQL_date__c, CreatedDate, LeadSource
+#   FROM Lead
+#   WHERE (Status = 'SQL' OR Status = 'Qualified' OR Status = 'Customer')
+#     AND Id IN     (SELECT mm_Lead__c FROM mm_Stage_History_Tracking__c WHERE mm_Stage__c = 'MQL')
+#     AND Id NOT IN (SELECT mm_Lead__c FROM mm_Stage_History_Tracking__c WHERE mm_Stage__c = 'SAL')
+#   ORDER BY CreatedDate DESC
+
+mql_no_sal_ids = set(
+    stages_per_person[
+        stages_per_person.apply(lambda x: 'MQL' in x and 'SAL' not in x)
+    ].index
+)
+
+try:
+    sql_mql = pd.read_csv('./Dataset/sql_mql_no_sal_leads.csv')
+    sql_mql.columns = sql_mql.columns.str.strip()
+    sql_lead_ids = set(sql_mql['Id'].str.strip())
+
+    group1_ids = mql_no_sal_ids & sql_lead_ids
+    group1_df = df[df['Unified_ID'].isin(group1_ids)].copy()
+    group1_df.to_csv('./Dataset/group1_sql_mql_no_sal.csv', index=False)
+    print(f"Group 1 (SQL + MQL, no SAL) → SAL backfill needed:    {len(group1_ids):>4} people")
+
+except FileNotFoundError:
+    print(
+        "Group 1: sql_mql_no_sal_leads.csv not found.\n"
+        "  Run the SOQL query above and save the result to ./Dataset/sql_mql_no_sal_leads.csv\n"
+        f"  (MQL-but-no-SAL pool from SHT: {len(mql_no_sal_ids)} people pending SQL verification)"
+    )
