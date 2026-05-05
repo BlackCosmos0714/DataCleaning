@@ -19,6 +19,13 @@ stages_per_person = df.groupby('Unified_ID')['mm_Stage__c'].apply(set)
 
 
 # ── GROUP 2: SAL but no MQL → MQL backfill needed ───────────────────────────
+# Reference SOQL (for validation against Lead records):
+#   SELECT Id, Name, SALDate__c, mm_SQL_date__c, CreatedDate, LeadSource, CreatedBy.Name
+#   FROM Lead
+#   WHERE (Status = 'SAL' OR Status = 'SQL' OR Status = 'Qualified' OR Status = 'Customer' OR Status = 'Nurture')
+#     AND Id IN     (SELECT mm_Lead__c FROM mm_Stage_History_Tracking__c WHERE mm_Stage__c = 'SAL')
+#     AND Id NOT IN (SELECT mm_Lead__c FROM mm_Stage_History_Tracking__c WHERE mm_Stage__c = 'MQL')
+#   ORDER BY CreatedDate DESC
 group2_ids = stages_per_person[
     stages_per_person.apply(lambda x: 'SAL' in x and 'MQL' not in x)
 ].index.tolist()
@@ -50,12 +57,14 @@ print(f"Group 3 (SQL, no MQL, no SAL) → flag for investigation: {len(group3_df
 
 
 # ── GROUP 1: SQL + MQL but no SAL → SAL backfill needed ─────────────────────
-# Requires a separate export of SQL leads who have MQL but no SAL in SHT.
+# Groups 1 & 2 use Stage History as the source of truth (presence of events).
+# Group 3 uses Lead directly (absence of events — SHT can't surface what never happened).
+#
 # Run this SOQL and save the result to ./Dataset/sql_mql_no_sal_leads.csv:
 #
-#   SELECT Id, Name, mm_SQL_date__c, CreatedDate, LeadSource
+#   SELECT Id, Name, mm_MQL_date__c, mm_SQL_date__c, CreatedDate, LeadSource, CreatedBy.Name
 #   FROM Lead
-#   WHERE (Status = 'SQL' OR Status = 'Qualified' OR Status = 'Customer')
+#   WHERE (Status = 'SQL' OR Status = 'Qualified' OR Status = 'Customer' OR Status = 'Nurture')
 #     AND Id IN     (SELECT mm_Lead__c FROM mm_Stage_History_Tracking__c WHERE mm_Stage__c = 'MQL')
 #     AND Id NOT IN (SELECT mm_Lead__c FROM mm_Stage_History_Tracking__c WHERE mm_Stage__c = 'SAL')
 #   ORDER BY CreatedDate DESC
