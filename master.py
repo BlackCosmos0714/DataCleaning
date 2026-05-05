@@ -1,93 +1,93 @@
 import pandas as pd
 
-# ── Load MQL/SAL stage history ──────────────────────────────────────────────
-df = pd.read_csv('./Dataset/Master.csv')
-df.columns = df.columns.str.strip()
-df['mm_Lead__c'] = df['mm_Lead__c'].str.strip().replace('', pd.NA)
-df['mm_Contact__c'] = df['mm_Contact__c'].str.strip().replace('', pd.NA)
-df['mm_Stage__c'] = df['mm_Stage__c'].str.strip()
+# ── Load data ──────────────────────────────────────────────────────────────
+sht = pd.read_csv('./Dataset/sht_raw.csv')
+leads_sql = pd.read_csv('./Dataset/leads_sql_raw.csv')
 
-# Drop rows where both IDs are absent
-df = df.dropna(subset=['mm_Lead__c', 'mm_Contact__c'], how='all')
+sht.columns = sht.columns.str.strip()
+leads_sql.columns = leads_sql.columns.str.strip()
 
-# Unified_ID: Lead ID takes priority, fall back to Contact ID
-df['Unified_ID'] = df['mm_Lead__c'].fillna(df['mm_Contact__c'])
-df['ID_Type'] = df['mm_Lead__c'].notna().map({True: 'Lead', False: 'Contact'})
+sht['mm_Lead__c'] = sht['mm_Lead__c'].str.strip().replace('', pd.NA)
+sht['mm_Contact__c'] = sht['mm_Contact__c'].str.strip().replace('', pd.NA)
+sht['mm_Stage__c'] = sht['mm_Stage__c'].str.strip()
 
-# Stage sets per person
-stages_per_person = df.groupby('Unified_ID')['mm_Stage__c'].apply(set)
+sht = sht.dropna(subset=['mm_Lead__c', 'mm_Contact__c'], how='all')
 
+# ── Build Lead → Contact conversion map ───────────────────────────────────
+converted = leads_sql[
+    leads_sql['IsConverted'].astype(str).str.lower() == 'true'
+][['Id', 'ConvertedContactId']].dropna()
 
-# ── GROUP 2: SAL but no MQL → MQL backfill needed ───────────────────────────
-# Reference SOQL (for validation against Lead records):
-#   SELECT Id, Name, SALDate__c, mm_SQL_date__c, CreatedDate, LeadSource, CreatedBy.Name
-#   FROM Lead
-#   WHERE (Status = 'SAL' OR Status = 'SQL' OR Status = 'Qualified' OR Status = 'Customer' OR Status = 'Nurture')
-#     AND Id IN     (SELECT mm_Lead__c FROM mm_Stage_History_Tracking__c WHERE mm_Stage__c = 'SAL')
-#     AND Id NOT IN (SELECT mm_Lead__c FROM mm_Stage_History_Tracking__c WHERE mm_Stage__c = 'MQL')
-#   ORDER BY CreatedDate DESC
-group2_ids = stages_per_person[
-    stages_per_person.apply(lambda x: 'SAL' in x and 'MQL' not in x)
-].index.tolist()
+lead_to_contact = dict(zip(
+    converted['Id'].str.strip(),
+    converted['ConvertedContactId'].str.strip()
+))
 
-group2_df = df[df['Unified_ID'].isin(group2_ids)].copy()
-group2_df.to_csv('./Dataset/group2_sal_no_mql.csv', index=False)
-print(f"Group 2 (SAL but no MQL)  → MQL backfill needed:       {len(group2_ids):>4} people")
+# ── Assign canonical ID ────────────────────────────────────────────────────
+# Converted leads → Contact ID (backfill targets the Contact)
+# Non-converted leads → Lead ID
+# Contact-only records → Contact ID
 
+def get_canonical_id(row):
+    lead_id = row['mm_Lead__c']
+    contact_id = row['mm_Contact__c']
+    if pd.notna(lead_id):
+        return lead_to_contact.get(lead_id, lead_id)
+    return contact_id
 
-# ── GROUP 3: SQL with no SAL and no MQL → flag for investigation ────────────
-# Source: Bucket3.csv — pre-exported via SOQL:
-#   SELECT Id, Name, mm_SQL_date__c, CreatedDate, LeadSource, CreatedBy.Name
-#   FROM Lead
-#   WHERE (Status = 'SQL' OR Status = 'Qualified' OR Status = 'Customer')
-#     AND Id NOT IN (SELECT mm_Lead__c FROM mm_Stage_History_Tracking__c WHERE mm_Stage__c = 'MQL')
-#     AND Id NOT IN (SELECT mm_Lead__c FROM mm_Stage_History_Tracking__c WHERE mm_Stage__c = 'SAL')
-#   ORDER BY CreatedDate DESC
+sht['canonical_id'] = sht.apply(get_canonical_id, axis=1)
 
-group3_df = pd.read_csv(
-    './Dataset/Bucket3.csv',
-    skiprows=2,
-    header=None,
-    names=['Lead_ID', 'Name', 'SQL_Date', 'Created_Date', 'Lead_Source', 'Created_By']
-)
-group3_df = group3_df.dropna(subset=['Lead_ID'])
-group3_df['Lead_ID'] = group3_df['Lead_ID'].str.strip()
-group3_df.to_csv('./Dataset/group3_sql_no_mql_no_sal.csv', index=False)
-print(f"Group 3 (SQL, no MQL, no SAL) → flag for investigation: {len(group3_df):>4} records")
+# ── Stage sets per person ──────────────────────────────────────────────────
+stages = sht.groupby('canonical_id')['mm_Stage__c'].apply(set)
 
+# ── SQL person set ─────────────────────────────────────────────────────────
+# Source 1: SQL stage present in SHT
+sql_from_sht = set(stages[stages.apply(lambda x: 'SQL' in x)].index)
 
-# ── GROUP 1: SQL + MQL but no SAL → SAL backfill needed ─────────────────────
-# Groups 1 & 2 use Stage History as the source of truth (presence of events).
-# Group 3 uses Lead directly (absence of events — SHT can't surface what never happened).
-#
-# Run this SOQL and save the result to ./Dataset/sql_mql_no_sal_leads.csv:
-#
-#   SELECT Id, Name, mm_MQL_date__c, mm_SQL_date__c, CreatedDate, LeadSource, CreatedBy.Name
-#   FROM Lead
-#   WHERE (Status = 'SQL' OR Status = 'Qualified' OR Status = 'Customer' OR Status = 'Nurture')
-#     AND Id IN     (SELECT mm_Lead__c FROM mm_Stage_History_Tracking__c WHERE mm_Stage__c = 'MQL')
-#     AND Id NOT IN (SELECT mm_Lead__c FROM mm_Stage_History_Tracking__c WHERE mm_Stage__c = 'SAL')
-#   ORDER BY CreatedDate DESC
+# Source 2: Lead.Status export (safety net for leads with no SHT entries)
+def lead_canonical_id(row):
+    lead_id = str(row['Id']).strip()
+    if str(row.get('IsConverted', '')).lower() == 'true':
+        contact_id = row.get('ConvertedContactId')
+        if pd.notna(contact_id):
+            return str(contact_id).strip()
+    return lead_id
 
-mql_no_sal_ids = set(
-    stages_per_person[
-        stages_per_person.apply(lambda x: 'MQL' in x and 'SAL' not in x)
-    ].index
-)
+leads_sql['canonical_id'] = leads_sql.apply(lead_canonical_id, axis=1)
+sql_from_leads = set(leads_sql['canonical_id'])
 
-try:
-    sql_mql = pd.read_csv('./Dataset/sql_mql_no_sal_leads.csv')
-    sql_mql.columns = sql_mql.columns.str.strip()
-    sql_lead_ids = set(sql_mql['Id'].str.strip())
+all_sql = sql_from_sht | sql_from_leads
 
-    group1_ids = mql_no_sal_ids & sql_lead_ids
-    group1_df = df[df['Unified_ID'].isin(group1_ids)].copy()
-    group1_df.to_csv('./Dataset/group1_sql_mql_no_sal.csv', index=False)
-    print(f"Group 1 (SQL + MQL, no SAL) → SAL backfill needed:    {len(group1_ids):>4} people")
+# ── Group 1: SQL + MQL + no SAL → SAL backfill ────────────────────────────
+group1 = {
+    cid for cid, s in stages.items()
+    if 'MQL' in s and 'SAL' not in s and cid in all_sql
+}
 
-except FileNotFoundError:
-    print(
-        "Group 1: sql_mql_no_sal_leads.csv not found.\n"
-        "  Run the SOQL query above and save the result to ./Dataset/sql_mql_no_sal_leads.csv\n"
-        f"  (MQL-but-no-SAL pool from SHT: {len(mql_no_sal_ids)} people pending SQL verification)"
-    )
+# ── Group 2: SAL + no MQL → MQL backfill ──────────────────────────────────
+group2 = {
+    cid for cid, s in stages.items()
+    if 'SAL' in s and 'MQL' not in s
+}
+
+# ── Group 3: SQL + no MQL + no SAL → investigate ──────────────────────────
+# From SHT: SQL stage present but MQL and SAL absent
+group3_in_sht = {
+    cid for cid, s in stages.items()
+    if 'SQL' in s and 'MQL' not in s and 'SAL' not in s
+}
+
+# Safety net: SQL leads that have no SHT entries at all
+group3_no_sht = all_sql - set(stages.index)
+
+group3 = group3_in_sht | group3_no_sht
+
+# ── Save outputs ───────────────────────────────────────────────────────────
+def save_group(ids, label, filename):
+    df = pd.DataFrame({'canonical_id': sorted(ids), 'group': label})
+    df.to_csv(f'./Dataset/{filename}', index=False)
+    print(f"{label}: {len(ids):>4} records  →  {filename}")
+
+save_group(group1, 'Group 1 - SAL Backfill',   'group1_sal_backfill.csv')
+save_group(group2, 'Group 2 - MQL Backfill',   'group2_mql_backfill.csv')
+save_group(group3, 'Group 3 - Investigate',    'group3_investigate.csv')
